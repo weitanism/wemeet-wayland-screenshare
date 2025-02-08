@@ -4,21 +4,40 @@
 #include <cstdio>
 #include <chrono>
 #include <vector>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 
 #include <glib-2.0/glib.h>
 #include <glib-2.0/gio/gio.h>
 #include <libportal/portal.h>
 
 #include <memory>
+#include <libdrm/drm_fourcc.h>
 #include <pipewire-0.3/pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/debug/pod.h>
 #include <spa/utils/dict.h>
+#include <spa/debug/format.h>
+
+// got to include this before X11 headers
+#include "hook_opencv.hpp"
 
 #include "format.hpp"
+#include "format_conversion.hpp"
 #include "interface.hpp"
 
 #include "helpers.hpp"
+
+struct dma_buf_sync {
+  uint64_t flags;
+};
+#define DMA_BUF_SYNC_READ (1 << 0)
+#define DMA_BUF_SYNC_START (0 << 2)
+#define DMA_BUF_SYNC_END (1 << 2)
+#define DMA_BUF_BASE 'b'
+#define DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+
+bool SyncDmaBuf(int fd);
 
 enum class DEType {
   GNOME,
@@ -206,7 +225,54 @@ struct PipewireScreenCast {
     // set up stream params
     this->param_buffer.reset(new uint8_t[param_buffer_size]);
     b = SPA_POD_BUILDER_INIT(param_buffer.get(), param_buffer_size);
+
+    uint64_t modifiers[1] = { DRM_FORMAT_MOD_LINEAR };
+    params[0] = build_format(&b, modifiers, 1);
+    params[1] = build_format(&b, nullptr, 0);
+
+    fprintf(stderr, "send formats:\n");
+    spa_debug_format(2, NULL, params[0]);
+    spa_debug_format(2, NULL, params[1]);
     
+    pw_stream_connect(stream, PW_DIRECTION_INPUT, PW_ID_ANY, pw_stream_flags(PW_STREAM_FLAG_AUTOCONNECT |  PW_STREAM_FLAG_MAP_BUFFERS), params, 2);
+  }
+
+  static struct spa_pod *build_format(struct spa_pod_builder *b, uint64_t *modifiers, int modifier_count) {
+    struct spa_pod_frame f[2];
+    int i, c;
+
+    spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+    spa_pod_builder_add(b, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video), 0);
+    spa_pod_builder_add(b, SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), 0);
+    /* format */
+    spa_pod_builder_add(b, SPA_FORMAT_VIDEO_format,
+                        SPA_POD_CHOICE_ENUM_Id(6,
+                            SPA_VIDEO_FORMAT_RGB,
+                            SPA_VIDEO_FORMAT_BGR,
+                            SPA_VIDEO_FORMAT_RGBA,
+                            SPA_VIDEO_FORMAT_BGRA,
+                            SPA_VIDEO_FORMAT_RGBx,
+                            SPA_VIDEO_FORMAT_BGRx),
+                        0);
+    /* modifiers */
+    if (modifier_count == 1 && modifiers[0] == DRM_FORMAT_MOD_INVALID) {
+      // we only support implicit modifiers, use shortpath to skip fixation phase
+      spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+      spa_pod_builder_long(b, modifiers[0]);
+    } else if (modifier_count > 0) {
+      // build an enumeration of modifiers
+      spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier,
+                           SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
+      spa_pod_builder_push_choice(b, &f[1], SPA_CHOICE_Enum, 0);
+      // modifiers from the array
+      for (i = 0, c = 0; i < modifier_count; i++) {
+        spa_pod_builder_long(b, modifiers[i]);
+        if (c++ == 0)
+          spa_pod_builder_long(b, modifiers[i]);
+      }
+      spa_pod_builder_pop(b, &f[1]);
+    }
+
     auto vidsize_default = SPA_RECTANGLE(320, 240);
     auto vidsize_min = SPA_RECTANGLE(1, 1);
     auto vidsize_max = SPA_RECTANGLE(DEFAULT_FB_ALLOC_WIDTH, DEFAULT_FB_ALLOC_HEIGHT);
@@ -214,28 +280,19 @@ struct PipewireScreenCast {
     auto vidframerate_default = SPA_FRACTION(20, 1);
     auto vidframerate_min = SPA_FRACTION(0, 1);
     auto vidframerate_max = SPA_FRACTION(1000, 1);
-    params[0] = reinterpret_cast<spa_pod*>(spa_pod_builder_add_object(&b,
-                SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-                SPA_FORMAT_mediaType,       SPA_POD_Id(SPA_MEDIA_TYPE_video),
-                SPA_FORMAT_mediaSubtype,    SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-                SPA_FORMAT_VIDEO_format,    SPA_POD_CHOICE_ENUM_Id(6,
-                                                SPA_VIDEO_FORMAT_RGB,
-                                                SPA_VIDEO_FORMAT_BGR,
-                                                SPA_VIDEO_FORMAT_RGBA,
-                                                SPA_VIDEO_FORMAT_BGRA,
-                                                SPA_VIDEO_FORMAT_RGBx,
-                                                SPA_VIDEO_FORMAT_BGRx
-                                                ),
-                SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(
-                                                &vidsize_default,
-                                                &vidsize_min,
-                                                &vidsize_max),
-                SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-                                                &vidframerate_default,
-                                                &vidframerate_min,
-                                                &vidframerate_max)));
-    
-    pw_stream_connect(stream, PW_DIRECTION_INPUT, PW_ID_ANY, pw_stream_flags(PW_STREAM_FLAG_AUTOCONNECT |  PW_STREAM_FLAG_MAP_BUFFERS), params, 1);
+    spa_pod_builder_add(b, SPA_FORMAT_VIDEO_size,
+                        SPA_POD_CHOICE_RANGE_Rectangle(
+                            &vidsize_default,
+                            &vidsize_min,
+                            &vidsize_max),
+                        0);
+    spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate,
+                        SPA_POD_CHOICE_RANGE_Fraction(
+                            &vidframerate_default,
+                            &vidframerate_min,
+                            &vidframerate_max),
+                        0);
+    return reinterpret_cast<spa_pod *>(spa_pod_builder_pop(b, &f[0]));
   }
 
   static void registry_global(void *data, uint32_t id, uint32_t permissions, const char *type, uint32_t version, const struct spa_dict *props) {
@@ -284,7 +341,7 @@ private:
   static constexpr size_t param_buffer_size = 1024;
   spa_pod_builder b;
   spa_hook listener;
-  const spa_pod* params[1];
+  const spa_pod* params[2];
   pw_stream_events stream_events;
   std::chrono::time_point<std::chrono::high_resolution_clock> last_frame_time;
   int counter{0};
@@ -345,6 +402,10 @@ private:
       fprintf(stderr, "%s", yellow_text("[payload pw] ignoring non-format param\n").c_str());
       return;
     }
+
+    fprintf(stderr, "got format:\n");
+    spa_debug_format(2, NULL, param);
+
     // we gather the actual video stream params here
     this_ptr->actual_params.update_from_pod(param);
 
@@ -353,10 +414,13 @@ private:
     const struct spa_pod *params[1];
 
     params[0] = (struct spa_pod *)(spa_pod_builder_add_object(&b,
-      SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-      SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoCrop),
-      SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region))
-    ));
+        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_buffers,    SPA_POD_CHOICE_RANGE_Int(8, 2, 64),
+        SPA_PARAM_BUFFERS_blocks,     SPA_POD_Int(1),
+        SPA_PARAM_BUFFERS_size,       SPA_POD_Int(this_ptr->actual_params.width * this_ptr->actual_params.height),
+        SPA_PARAM_BUFFERS_stride,     SPA_POD_Int(this_ptr->actual_params.width),
+        SPA_PARAM_BUFFERS_dataType,   SPA_POD_CHOICE_FLAGS_Int((1<<SPA_DATA_MemPtr) | (1<<SPA_DATA_DmaBuf)))
+    );
     pw_stream_update_params(this_ptr->stream.load(), params, 1);
   }
 
@@ -377,15 +441,9 @@ private:
       pw_stream_queue_buffer(this_ptr->stream, b);
       return;
     }
-    
+
     // start processing frame
-    this_ptr->processed_frame_count++;
     this_ptr->last_frame_time = cur_frame_time;
-
-    if (this_ptr->processed_frame_count % this_ptr->reporting_interval == 0) {
-      fprintf(stderr, "%s", yellow_text("[payload pw] processed frame count: " + std::to_string(this_ptr->processed_frame_count) + "\n").c_str());
-    }
-
 
     // try to write to the frame buffer if the param is good
     if (this_ptr->actual_params.param_good){
@@ -410,17 +468,40 @@ private:
         this_ptr->actual_params.format
       );
 
-      // copy the data from the pw buffer to the frame buffer
-      uint8_t* pw_chunk_ptr = reinterpret_cast<uint8_t*>( b->buffer->datas[0].data);
-      uint32_t pw_chunk_stride = b->buffer->datas[0].chunk->stride;
-      uint32_t pw_chunk_offset = b->buffer->datas[0].chunk->offset % b->buffer->datas[0].maxsize;
-      pw_chunk_ptr += pw_chunk_offset;
-
-      for (int row_idx = 0; row_idx < height; ++row_idx) {
-        uint8_t* framebuffer_row_start = framebuffer.data.get() + row_idx * framebuffer.row_byte_stride;
-        uint8_t* pw_chunk_row_start = pw_chunk_ptr + (row_idx + y) * pw_chunk_stride + x * spa_videoformat_bytesize(this_ptr->actual_params.format);
-        memcpy(framebuffer_row_start, pw_chunk_row_start, width * spa_videoformat_bytesize(this_ptr->actual_params.format));
+      auto d = b->buffer->datas[0];
+      if (d.type != SPA_DATA_DmaBuf) {
+        pw_stream_queue_buffer(this_ptr->stream, b);
+        return;
       }
+
+      size_t dma_buf_size = height * width * 4;
+      void* dma_buf_ptr = mmap(nullptr, dma_buf_size, PROT_READ, MAP_SHARED, d.fd, d.mapoffset);
+      if (dma_buf_ptr == MAP_FAILED) {
+        fprintf(stderr, "%s", red_text("[payload pw] failed to mmap the memory\n").c_str());
+        return;
+      }
+
+      // if (this_ptr->processed_frame_count % this_ptr->reporting_interval == 0) {
+      //   fprintf(stderr, "%s", red_text("[payload pw] sync dmabuf\n").c_str());
+      // }
+      SyncDmaBuf(d.fd);
+
+      // uint8_t* src_addr = static_cast<uint8_t*>( dma_buf_ptr );
+      memcpy(framebuffer.data.get(), dma_buf_ptr, height * framebuffer.row_byte_stride);
+
+      SyncDmaBuf(d.fd);
+      munmap(dma_buf_ptr, dma_buf_size);
+      // fprintf(stderr, "%s", yellow_text("[payload pw] copy data done\n").c_str());
+
+      // CvMat* mat = OpencvDLFCNSingleton::cvCreateMat(height, width, CV_8UC4);
+      // PopulateImageMat(framebuffer, *mat, framebuffer.format);
+      // int code = OpencvDLFCNSingleton::cvSaveImage("/tmp/test.jpg", mat);
+      // if (code != 1) {
+      //   fprintf(stderr, "%s", yellow_text("[payload pw] save image res=" + std::to_string(code) + "\n").c_str());
+      // }
+      // OpencvDLFCNSingleton::cvReleaseMat(&mat);
+
+      this_ptr->processed_frame_count++;
     }
 
     

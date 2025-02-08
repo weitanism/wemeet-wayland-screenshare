@@ -23,6 +23,22 @@ struct CandidateWindowInfo{
   int window_height;
 };
 
+// https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/portal/pipewire_utils.h;drc=003b43cb850a2fb81bb482cd95381338b7205933;l=54
+bool SyncDmaBuf(int fd) {
+  struct dma_buf_sync sync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+  while (true) {
+    int ret;
+    ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    if (ret == -1 && errno == EINTR) {
+      continue;
+    } else if (ret == -1) {
+      return false;
+    } else {
+      break;
+    }
+  }
+  return true;
+}
 
 std::vector<CandidateWindowInfo> x11_sanitizer_get_targets(
   Display* display,

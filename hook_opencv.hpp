@@ -22,6 +22,10 @@ private:
     if(libopencv_imgproc_handle == nullptr){
       throw std::runtime_error("Failed to open library libopencv_imgproc.so");
     }
+    libopencv_imgcodecs_handle = dlopen("libopencv_imgcodecs.so", RTLD_LOCAL|RTLD_LAZY);
+    if(libopencv_imgcodecs_handle == nullptr){
+      throw std::runtime_error("Failed to open library libopencv_imgcodecs.so");
+    }
   }
 
 public:
@@ -110,9 +114,22 @@ public:
     return func(src, dst, code);
   }
 
+  static inline int cvSaveImage(
+    const char* filename, const CvArr* image,
+    const int* params = 0
+  ){
+    using FType = int(const char*, const CvArr*, const int*);
+    auto& singleton = getSingleton();
+    static auto func = (FType*)dlsym(singleton.libopencv_imgcodecs_handle, "cvSaveImage");
+    if (func == nullptr) {
+      return -1;
+    }
+    return func(filename, image, params);
+  }
 
   void* libopencv_core_handle{nullptr};
   void* libopencv_imgproc_handle{nullptr};
+  void* libopencv_imgcodecs_handle{nullptr};
 
 
 };

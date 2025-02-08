@@ -14,6 +14,7 @@
 #include <X11/Xlib.h>
 
 #include "framebuf.hpp"
+#include "format_conversion.hpp"
 #include "payload.hpp"
 #include "interface.hpp"
 #include "helpers.hpp"
@@ -102,41 +103,7 @@ struct remove_pointer_cvref {
 template <typename T>
 using remove_pointer_cvref_t = typename remove_pointer_cvref<T>::type;
 
-
-// returns: ximage_width_offset, ximage_height_offset, target_width, target_height
-std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> get_resize_param(
-  uint32_t ximage_width,
-  uint32_t ximage_height,
-  uint32_t framebuffer_width,
-  uint32_t framebuffer_height
-){
-  // keep the framebuffer aspect ratio
-  double framebuffer_aspect_ratio = static_cast<double>(framebuffer_width) / static_cast<double>(framebuffer_height);
-  double ximage_aspect_ratio = static_cast<double>(ximage_width) / static_cast<double>(ximage_height);
-
-  uint32_t target_width = 0;
-  uint32_t target_height = 0;
-  uint32_t ximage_width_offset = 0;
-  uint32_t ximage_height_offset = 0;
-
-  if (framebuffer_aspect_ratio > ximage_aspect_ratio) {
-    // framebuffer is wider than ximage
-    target_width = ximage_width;
-    target_height = (ximage_width * framebuffer_height) / framebuffer_width;
-    ximage_height_offset = (ximage_height - target_height) / 2;
-  } else {
-    // framebuffer is taller than ximage
-    target_height = ximage_height;
-    target_width = ximage_height * framebuffer_width / framebuffer_height;
-    ximage_width_offset = (ximage_width - target_width) / 2;
-  }
-
-  return std::make_tuple(ximage_width_offset, ximage_height_offset, target_width, target_height);
-}
-
-
 void XShmGetImageHook(XImage& image){
-
   auto& interface_singleton = InterfaceSingleton::getSingleton();
 
   if (interface_singleton.interface_handle.load() == nullptr){
@@ -154,67 +121,10 @@ void XShmGetImageHook(XImage& image){
     &ximage_cvmat, ximage_height, ximage_width,
     CV_8UC4, image.data, ximage_bytes_per_line
   );
-  OpencvDLFCNSingleton::cvSetZero(&ximage_cvmat);
 
   auto& framebuffer = interface_singleton.interface_handle.load()->framebuf;
-  auto framebuffer_spa_format = framebuffer.format;
-  auto framebuffer_width = framebuffer.width;
-  auto framebuffer_height = framebuffer.height;
-  auto framebuffer_row_byte_stride = framebuffer.row_byte_stride;
-
-  CvMat framebuffer_cvmat;
-  OpencvDLFCNSingleton::cvInitMatHeader(
-    &framebuffer_cvmat, framebuffer_height, framebuffer_width,
-    CV_8UC4, framebuffer.data.get(), framebuffer_row_byte_stride
-  );
-
-  
-  // get the resize parameters
-  auto [ximage_width_offset, ximage_height_offset, target_width, target_height] = get_resize_param(
-    ximage_width, ximage_height, framebuffer_width, framebuffer_height
-  );
-  CvMat ximage_cvmat_roi;
-  OpencvDLFCNSingleton::cvGetSubRect(
-    &ximage_cvmat, &ximage_cvmat_roi,
-    cvRect(ximage_width_offset, ximage_height_offset, target_width, target_height)
-  );
-  OpencvDLFCNSingleton::cvResize(
-    &framebuffer_cvmat, &ximage_cvmat_roi, CV_INTER_LINEAR
-  );
-
-  // do color convert
-  // here the code is currently mainly for wlroot WMs
-  // maybe we could shortcut this by detecting WM?
-
-  int cv_cAPI_color_cvt_code = get_opencv_cAPI_color_convert_code(
-    framebuffer_spa_format, ximage_spa_format
-  );
-
-  if (cv_cAPI_color_cvt_code != -1){
-    // non -1 code means color conversion is needed
-    OpencvDLFCNSingleton::cvCvtColor(
-      &ximage_cvmat_roi, &ximage_cvmat_roi, cv_cAPI_color_cvt_code
-    );
-  }
-
-  // legacy stb implementation
-  // resize the framebuffer to ximage size
-  // note: by using STBIR_BGRA_PM we are essentially ignoring the alpha channel
-  // heck, I don't even know if the alpha channel is used in the first place
-  // Anyway, we are just going to ignore it for now since this will be much faster
-  // stbir_resize_uint8_srgb(
-  //   reinterpret_cast<uint8_t*>(framebuffer.data.get()),
-  //   framebuffer_width, framebuffer_height, framebuffer_row_byte_stride,
-  //   reinterpret_cast<uint8_t*>(image.data),
-  //   ximage_width, ximage_height, ximage_bytes_per_line,
-  //   stbir_pixel_layout::STBIR_BGRA_PM
-  // );
-
-
-  return;
-  
+  PopulateImageMat(framebuffer, ximage_cvmat, ximage_spa_format);
 }
-
 
 
 void XShmDetachStopPWLoop(){

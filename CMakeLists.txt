@@ -14,6 +14,8 @@ pkg_check_modules(LIBPORTAL REQUIRED libportal)
 # pipewire
 pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
 
+pkg_check_modules(PKG_Libdrm REQUIRED libdrm)
+message(STATUS "libdrm include dirs: ${PKG_Libdrm_INCLUDE_DIRS}")
 
 find_package(X11 REQUIRED)
 
@@ -61,6 +63,8 @@ function(add_compile_options_for TARGET_NAME)
 
   target_link_libraries(${TARGET_NAME} PRIVATE X11::X11)
   target_link_libraries(${TARGET_NAME} PRIVATE X11::Xrandr)
+
+  target_include_directories(${TARGET_NAME} PRIVATE ${PKG_Libdrm_INCLUDE_DIRS})
 
 endfunction()
 
