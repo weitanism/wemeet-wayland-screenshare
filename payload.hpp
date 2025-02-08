@@ -192,7 +192,7 @@ struct XdpScreencastPortal {
 struct PipewireScreenCast {
   using THIS_CLASS = PipewireScreenCast;
 
-  PipewireScreenCast(int pw_fd, int pw_node_id, double target_framerate = 20.0, uint64_t reporting_interval = 20):
+  PipewireScreenCast(int pw_fd, int pw_node_id, double target_framerate = 40.0, uint64_t reporting_interval = 20):
     node_id(pw_node_id),
     target_framerate(target_framerate),
     reporting_interval(reporting_interval),
